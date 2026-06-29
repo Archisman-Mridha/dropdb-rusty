@@ -52,7 +52,7 @@ use {
     wal::proto::WalEntry
   },
   crc32fast::hash,
-  parking_lot::RwLock,
+  parking_lot::{RwLock, RwLockWriteGuard},
   prost::Message,
   std::{
     cmp::{max, min},
@@ -74,6 +74,8 @@ mod proto {
 
 const DEFAULT_DIR: &str = "~/.dropdb-rusty/wal";
 
+const CHECKPOINT_FILE_NAME: &str = ".checkpoint";
+
 const DEFAULT_MAX_SEGMENT_SIZE: SegmentSize = 16 * 1024; // = 16 KB.
 const DEFAULT_MAX_SEGMENT_COUNT: usize = 1000;
 
@@ -85,9 +87,14 @@ type SegmentAppender = BufWriter<File>;
 
 pub struct ThreadSafeWAL(Arc<RwLock<WAL>>);
 
-struct WAL {
+pub struct WAL {
   /// The directory where segments are stored.
   dir: PathBuf,
+
+  /// Path to the .checkpoint file, where information about the latest checkpoint is stored in
+  /// this format : <segment ID>:<entry LSN>.
+  /// When empty, it indicates that there are no checkpoints.
+  checkpoint_file_path: PathBuf,
 
   /// Maximum byte size a segment can grow to.
   max_segment_size: SegmentSize,
@@ -177,7 +184,9 @@ impl ThreadSafeWAL {
       }
     };
 
-    let wal = WAL { dir: options.dir,
+    let wal = WAL { dir: options.dir.clone(),
+
+                    checkpoint_file_path: options.dir.join(CHECKPOINT_FILE_NAME),
 
                     max_segment_size: options.max_segment_size,
                     max_segment_count: options.max_segment_count,
@@ -188,12 +197,29 @@ impl ThreadSafeWAL {
                     active_segment_appender,
 
                     next_entry_lsn };
-
     Ok(Self(Arc::new(RwLock::new(wal))))
+  }
+
+  /// First, rotates the WAL if necessary.
+  /// Then, creates a new entry out of the given data, writing it to the active segment.
+  pub fn write(&mut self, data: Vec<u8>) -> Result<()> {
+    let mut wal = self.0.write();
+    wal.write_entry(data, false)
+  }
+
+  /// First, rotates the WAL if necessary.
+  /// Then, creates a new entry out of the given data, writing it to the active segment.
+  /// And, that entry is also used as a checkpoint.
+  pub fn checkpoint(&mut self, data: Vec<u8>) -> Result<()> {
+    let mut wal = self.0.write();
+    wal.write_entry(data, true)
   }
 }
 
 impl WAL {
+  /// First, rotates the WAL if necessary.
+  /// Then, creates a new entry out of the given data, writing it to the active segment.
+  /// You can specify to use that entry as a checkpoint as well.
   fn write_entry(&mut self, data: Vec<u8>, is_checkpoint: bool) -> Result<()> {
     self.rotate_if_required()?;
 
@@ -210,16 +236,29 @@ impl WAL {
                            crc: hash(&data),
                            data };
 
-    let mut buffer = Vec::with_capacity(mem::size_of::<u32>() + entry.encoded_len());
+    let mut buffer = Vec::with_capacity(4 + entry.encoded_len());
 
     buffer.extend_from_slice(&(entry.encoded_len() as u32).to_le_bytes());
     entry.encode(&mut buffer)?;
 
     self.active_segment_appender.write_all(&buffer)?;
 
-    // Ensure all changes in the active segment are persisted to the disk, if this is a checkpoint.
+    // When using this entry as a checkpoint,
     if is_checkpoint {
+      // Ensure all changes in the active segment are persisted to the disk, if this is a
+      // checkpoint.
       self.sync()?;
+
+      // Update information about the latest checkpoint in the .checkpoint file.
+
+      let latest_checkpoint_information = format!("{}:{}", self.active_segment_id, entry.lsn);
+
+      let mut checkpoint_file_updater =
+        File::options().write(true).truncate(true).open(&self.checkpoint_file_path)?;
+
+      checkpoint_file_updater.write(latest_checkpoint_information.as_bytes())?;
+
+      checkpoint_file_updater.sync_data()?;
     }
 
     // Update what will be the next entry's LSN.
@@ -310,40 +349,44 @@ fn get_last_entry_in_segment(wal_dir: &Path, segment_id: SegmentID) -> Result<pr
 
   let mut segment_reader = File::options().read(true).open(segment_path)?;
 
+  let segment_size = segment_reader.metadata()?.size();
+
   // Seek to the beginning of the file.
   segment_reader.seek(SeekFrom::Start(0))?;
 
-  let mut last_entry_offset: u64 = 0;
-  let mut last_entry_encoding_size: u32 = 0;
+  let mut last_entry_encoding_size = 0;
 
   loop {
     // Get the current entry encoding size.
-    let mut entry_encoding_size: [u8; 4] = [0; 4];
-    match segment_reader.read_exact(&mut entry_encoding_size) {
+    let mut current_entry_encoding_size: [u8; 4] = [0; 4];
+    match segment_reader.read_exact(&mut current_entry_encoding_size) {
       // There are no entries left.
       // So, we now have the last entry.
       | Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
 
+      | Err(error) => return Err(error.into()),
+
       | _ => {}
     }
-    let current_entry_encoding_size = u32::from_le_bytes(entry_encoding_size);
+    let current_entry_encoding_size = u32::from_le_bytes(current_entry_encoding_size);
 
-    // Calculate the current entry offset.
-    let current_entry_offset =
-      last_entry_offset + (last_entry_encoding_size + current_entry_encoding_size) as u64;
+    segment_reader.seek(SeekFrom::Current(4))?;
 
-    // Seek to the end of the current entry.
-    // So, if there is any entry after the current entry, that will be read in the next iteration.
-    let current_entry_ends_at = current_entry_offset + current_entry_encoding_size as u64;
-    segment_reader.seek(SeekFrom::Start(current_entry_ends_at))?;
+    // Check if this is the last entry.
+    // When yes, we can break out of the loop.
 
-    // The current entry might be the last entry.
-    last_entry_offset = current_entry_offset;
-    last_entry_encoding_size = current_entry_encoding_size;
+    let current_entry_ends_at =
+      segment_reader.stream_position()? + (4 + current_entry_encoding_size) as u64;
+
+    if current_entry_ends_at == segment_size {
+      last_entry_encoding_size = current_entry_encoding_size;
+
+      break;
+    }
+
+    // Otherwise, seek to the beginning of the next entry.
+    segment_reader.seek(SeekFrom::Current(current_entry_encoding_size as i64))?;
   }
-
-  // Seek to the last entry offset.
-  segment_reader.seek(SeekFrom::Start(last_entry_offset))?;
 
   // Read the last entry's encoding.
   let mut last_entry_encoding = Vec::with_capacity(last_entry_encoding_size as usize);
@@ -365,4 +408,138 @@ fn decode_entry(encoding: &[u8]) -> Result<WalEntry> {
   }
 
   Ok(entry)
+}
+
+pub struct WALReplayer<'wal_replayer> {
+  /// Write lock on the thread safe WAL.
+  thread_safe_wal: RwLockWriteGuard<'wal_replayer, WAL>,
+
+  current_segment_id:     SegmentID,
+  current_segment_reader: Option<File>
+}
+
+impl<'wal_replayer> WALReplayer<'wal_replayer> {
+  /// Constructs an instance of the WAL replayer.
+  /// We assume that a latest checkpoint already exists.
+  pub fn new(thread_safe_wal: RwLockWriteGuard<'wal_replayer, WAL>) -> Result<Self> {
+    // Read information about the latest checkpoint from the .checkpoint file.
+
+    let checkpoint_file_path = thread_safe_wal.dir.join(CHECKPOINT_FILE_NAME);
+    let latest_checkpoint_information = fs::read_to_string(checkpoint_file_path)?;
+
+    let (current_segment_id, checkpoint_entry_lsn) =
+      latest_checkpoint_information.trim().split_once(":").ok_or(Error::InvalidCheckpointFile)?;
+
+    let current_segment_id =
+      current_segment_id.parse::<SegmentID>().map_err(|_| Error::InvalidCheckpointFile)?;
+
+    let checkpoint_entry_lsn =
+      checkpoint_entry_lsn.parse::<u32>().map_err(|_| Error::InvalidCheckpointFile)?;
+
+    // Create the segment reader.
+
+    let current_segment_path =
+      thread_safe_wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{current_segment_id}"));
+
+    let mut current_segment_reader = File::options().read(true).open(current_segment_path)?;
+
+    current_segment_reader.seek(SeekFrom::Start(0))?;
+
+    // And seek to the end of the entry which represents the latest checkpoint.
+    loop {
+      // Read the current entry encoding size.
+
+      let mut current_entry_encoding_size: [u8; 4] = [0; 4];
+      current_segment_reader.read_exact(&mut current_entry_encoding_size)?;
+      let current_entry_encoding_size = u32::from_le_bytes(current_entry_encoding_size);
+
+      current_segment_reader.seek(SeekFrom::Current(4))?;
+
+      // Read and decode the current entry encoding.
+
+      let mut current_entry_encoding = Vec::with_capacity(current_entry_encoding_size as usize);
+      current_segment_reader.read_exact(&mut current_entry_encoding)?;
+
+      let current_entry = decode_entry(&current_entry_encoding)?;
+
+      current_segment_reader.seek(SeekFrom::Current(current_entry_encoding_size as i64))?;
+
+      // That entry was the latest checkpoint.
+      // So, we're done with seeking. And can start with replaying the WAL.
+      if current_entry.lsn == checkpoint_entry_lsn {
+        break;
+      }
+    }
+
+    Ok(Self { thread_safe_wal,
+
+              current_segment_id,
+              current_segment_reader: Some(current_segment_reader) })
+  }
+
+  /// Get the next entry, if exists.
+  pub fn try_next(&mut self) -> Result<Option<WalEntry>> {
+    loop {
+      // Try getting the current segment reader.
+      let current_segment_reader = match self.current_segment_reader {
+        // There are no more segments to read.
+        // So, we don't need to do anything further.
+        | None => return Ok(None),
+
+        | Some(ref mut current_segment_reader) => current_segment_reader
+      };
+
+      // Get the seek position of the current segment reader.
+      let seek_position = current_segment_reader.stream_position()?;
+
+      // Check whether seek position is at the EOF : which means there are no more entries to be
+      // read from the current segment, and we need to look if there is a next segment to read.
+
+      let current_segment_size = current_segment_reader.metadata()?.size();
+
+      if seek_position == current_segment_size {
+        let next_segment_id = self.current_segment_id + 1;
+        let next_segment_path =
+          self.thread_safe_wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{next_segment_id}"));
+
+        let mut next_segment_reader = match File::options().read(true).open(next_segment_path) {
+          // The next segment doesn't exist.
+          // So, we don't need to do anything further.
+          | Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+
+          | result => result
+        }?;
+
+        // There is a next segment to be read.
+
+        // Seek to it's beginning.
+        next_segment_reader.seek(SeekFrom::Start(0))?;
+
+        // And make it the current segment. We're going to process it in the next iteration.
+        self.current_segment_id = next_segment_id;
+        self.current_segment_reader = Some(next_segment_reader);
+
+        continue;
+      }
+
+      // At this point, we're sure that there's an entry to be read in the current segment.
+
+      // Read the current entry encoding size.
+
+      let mut current_entry_encoding_size: [u8; 4] = [0; 4];
+      current_segment_reader.read_exact(&mut current_entry_encoding_size)?;
+      let current_entry_encoding_size = u32::from_le_bytes(current_entry_encoding_size);
+
+      current_segment_reader.seek(SeekFrom::Current(4))?;
+
+      // Read and decode the current entry encoding.
+
+      let mut current_entry_encoding = Vec::with_capacity(current_entry_encoding_size as usize);
+      current_segment_reader.read_exact(&mut current_entry_encoding)?;
+
+      let current_entry = decode_entry(&current_entry_encoding)?;
+
+      return Ok(Some(current_entry));
+    }
+  }
 }

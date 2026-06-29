@@ -5,6 +5,9 @@ pub enum Error {
   #[error("{0}")]
   IO(#[from] std::io::Error),
 
+  #[error("Invalid checkpoint file")]
+  InvalidCheckpointFile,
+
   #[error("Failed encoding WAL entry : {0}")]
   EncodingWALEntry(#[from] prost::EncodeError),
 
