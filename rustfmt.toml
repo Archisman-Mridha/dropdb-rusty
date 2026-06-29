@@ -1,0 +1,24 @@
+style_edition = "2024"
+unstable_features = true
+
+tab_spaces = 2
+
+comment_width = 100
+
+indent_style = "Visual"
+
+use_small_heuristics = "Off"
+wrap_comments = true
+
+group_imports = "One"
+imports_granularity = "One"
+
+struct_field_align_threshold = 80
+use_field_init_shorthand = true
+
+trailing_comma = "Never"
+
+fn_single_line = true
+
+match_arm_blocks = false
+match_arm_leading_pipes = "Always"

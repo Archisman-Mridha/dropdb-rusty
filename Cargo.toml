@@ -1,0 +1,13 @@
+[package]
+name = "dropdb-rusty"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32fast = "1.5.0"
+parking_lot = "0.12.5"
+prost = "0.14.4"
+thiserror = "2.0.18"
+
+[build-dependencies]
+prost-build = "0.14.4"

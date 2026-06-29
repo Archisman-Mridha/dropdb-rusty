@@ -1,0 +1,5 @@
+version: v2
+
+modules:
+  - path: dropdb_rusty
+    name: dropdb_rusty

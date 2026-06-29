@@ -1,0 +1,69 @@
+// MIT License
+//
+// Copyright (c) 2026 DropDB (Rusty)
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+syntax = "proto3";
+
+package dropdb_rusty.v1;
+
+message WALEntry {
+  uint32 lsn = 1;
+
+  bool is_checkpoint = 2;
+
+  /*
+     Files on disk may get damaged or corrupted by software bugs and hardware failures. To identify
+     these problems preemptively and avoid propagating corrupt data to other subsystems or even
+     nodes, we can use checksums and cyclic redundancy checks (CRCs).
+
+     Some sources make no distinction between cryptographic and noncryptographic hash functions,
+     CRCs, and checksums. What they all have in common is that they reduce a large chunk of data to
+     a small number, but their use cases, purposes, and guarantees are different.
+
+     Checksums provide the weakest form of guarantee and aren’t able to detect corruption in
+     multiple bits. They’re usually computed by using XOR with parity checks or summation.
+
+     CRCs can help detect burst errors (e.g., when multiple consecutive bits got corrupted) and
+     their implementations usually use lookup tables and polynomial division. Multibit errors are
+     crucial to detect, since a significant percentage of failures in communication networks and
+     storage devices manifest this way.
+
+     WARNING: Noncryptographic hashes and CRCs should not be used to verify whether or not the data
+             has been tampered with. For this, you should always use strong cryptographic hashes
+             designed for security. The main goal of CRC is to make sure that there were no
+             unintended and accidental changes in data. These algorithms are not designed to resist
+             attacks and intentional changes in data.
+
+     Before writing the data on disk, we compute its checksum and write it together with the data.
+     When reading it back, we compute the checksum again and compare it with the written one. If
+     there’s a checksum mismatch, we know that corruption has occurred and we should not use the
+     data that was read.
+
+     Since computing a checksum over the whole file is often impractical and it is unlikely we’re
+     going to read the entire content every time we access it, page checksums are usually computed
+     on pages and placed in the page header. This way, checksums can be more robust (since they are
+     performed on a small subset of the data), and the whole file doesn’t have to be discarded if
+     corruption is contained in a single page.
+  */
+  uint32 crc = 3;
+
+  bytes data = 4;
+}
